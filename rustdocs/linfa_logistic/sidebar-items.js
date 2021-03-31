@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["FittedLogisticRegression","A fitted logistic regression which can make predictions"],["LogisticRegression","A two-class logistic regression model."]]});
