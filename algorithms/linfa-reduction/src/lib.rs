@@ -12,8 +12,8 @@
 extern crate ndarray;
 
 pub mod diffusion_map;
-pub mod error;
 pub mod pca;
+pub mod error;
 pub mod utils;
 
 pub use diffusion_map::DiffusionMap;

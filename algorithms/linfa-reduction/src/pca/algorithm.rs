@@ -22,29 +22,53 @@
 //! ```
 //!
 use crate::error::{Error, Result};
-use ndarray::{Array1, Array2, ArrayBase, Axis, Data, Ix2};
-use ndarray_linalg::{TruncatedOrder, TruncatedSvd};
+use ndarray::{Array1, Array2, ArrayBase, Axis, Data, Ix2, Zip};
+use ndarray_linalg::{TruncatedOrder, TruncatedSvd, generate, Lapack};
+use ndarray_linalg::lobpcg::{lobpcg, LobpcgResult};
 #[cfg(feature = "serde")]
 use serde_crate::{Deserialize, Serialize};
+use super::svd::svd;
 
-use linfa::{
-    dataset::Records,
-    traits::{Fit, PredictRef, Transformer},
-    DatasetBase, Float,
-};
+use linfa::{dataset::Records, traits::{Fit, PredictRef, Transformer}, DatasetBase, Float, Dataset, DatasetView};
+use num_traits::NumCast;
+use linfa::linalg::{normalize, NormalizeAxis};
+use linfa_elasticnet::ElasticNet;
+use crate::pca::svd::MagnitudeCorrection;
 
-/// Pincipal Component Analysis parameters
+/// Principal Component Analysis parameters
 #[cfg_attr(
     feature = "serde",
     derive(Serialize, Deserialize),
     serde(crate = "serde_crate")
 )]
-pub struct PcaParams {
-    embedding_size: usize,
+pub struct PcaParams<F: Float> {
+    n_components: usize,
+    l1_penalty: F,
+    l2_penalty: F,
     apply_whitening: bool,
+    max_n_iterations: usize,
+    tolerance: F
 }
 
-impl PcaParams {
+impl<F: Float> PcaParams<F> {
+    pub fn n_components(mut self, n_components: usize) -> Self {
+        self.n_components = n_components;
+
+        self
+    }
+
+    pub fn l1_penalty(mut self, l1_penalty: F) -> Self {
+        self.l1_penalty = l1_penalty;
+
+        self
+    }
+
+    pub fn l2_penalty(mut self, l2_penalty: F) -> Self {
+        self.l2_penalty = l2_penalty;
+
+        self
+    }
+
     /// Apply whitening to the embedding vector
     ///
     /// Whitening will scale the eigenvalues of the transformation such that the covariance will be
@@ -53,6 +77,32 @@ impl PcaParams {
         self.apply_whitening = apply;
 
         self
+    }
+
+    pub fn max_n_iterations(mut self, max_n_iterations: usize) -> Self {
+        self.max_n_iterations = max_n_iterations;
+
+        self
+    }
+
+    pub fn tolerance(mut self, tolerance: F) -> Self {
+        self.tolerance = tolerance;
+
+        self
+    }
+
+    pub fn validate_params(&self) -> Result<()> {
+        if self.l1_penalty.is_negative() {
+            let msg = format!("L1 Penalty should be positive, but is {}", self.l1_penalty);
+            return Err(linfa::Error::Parameters(msg).into());
+        }
+
+        if self.l2_penalty.is_negative() {
+            let msg = format!("L2 Penalty should be positive, but is {}", self.l2_penalty);
+            return Err(linfa::Error::Parameters(msg).into());
+        }
+
+        Ok(())
     }
 }
 
@@ -68,25 +118,25 @@ impl PcaParams {
 /// # Returns
 ///
 /// A fitted PCA model with origin and hyperplane
-impl<T, D: Data<Elem = f64>> Fit<ArrayBase<D, Ix2>, T, Error> for PcaParams {
+impl<T, D: Data<Elem = f64>> Fit<ArrayBase<D, Ix2>, T, Error> for PcaParams<f64> {
     type Object = Pca<f64>;
 
     fn fit(&self, dataset: &DatasetBase<ArrayBase<D, Ix2>, T>) -> Result<Pca<f64>> {
         if dataset.nsamples() == 0 {
             return Err(Error::NotEnoughSamples);
         }
+        self.validate_params()?;
+
         let x = dataset.records();
         // calculate mean of data and subtract it
         // safe because of above 0 samples check
         let mean = x.mean_axis(Axis(0)).unwrap();
         let x = x - &mean;
 
-        // estimate Singular Value Decomposition
-        let result =
-            TruncatedSvd::new(x, TruncatedOrder::Largest).decompose(self.embedding_size)?;
-
-        // explained variance is the spectral distribution of the eigenvalues
-        let (_, sigma, mut v_t) = result.values_vectors();
+        let (sigma, mut v_t) = match self.l1_penalty > f64::EPSILON || self.l2_penalty > f64::EPSILON {
+            true => Pca::sparse_vt(&x, self),
+            false => Pca::vt(x, self)
+        };
 
         // cut singular values to avoid numerical problems
         let sigma = sigma.mapv(|x| x.max(1e-8));
@@ -144,11 +194,33 @@ impl Pca<f64> {
     ///
     /// # Parameters
     ///
-    ///  * `embedding_size`: the target dimensionality
-    pub fn params(embedding_size: usize) -> PcaParams {
-        PcaParams {
-            embedding_size,
+    ///  * `n_components`: the target dimensionality
+    pub fn params<F: Float>(n_components: usize) -> PcaParams<F> {
+        PcaParams::<F> {
+            n_components,
+            l1_penalty: F::zero(),
+            l2_penalty: F::zero(),
             apply_whitening: false,
+            max_n_iterations: 1000,
+            tolerance: F::cast(1e-8)
+        }
+    }
+
+    /// Create default parameter set
+    ///
+    /// # Parameters
+    ///
+    ///  * `n_components`: the target dimensionality
+    ///  * `l1_penalty`: the lasso penalty
+    ///  * `l2_penalty`: the ridge penalty
+    pub fn sparse_params<F: Float>(n_components: usize, l1_penalty: F, l2_penalty: F) -> PcaParams<F> {
+        PcaParams::<F> {
+            n_components,
+            l1_penalty,
+            l2_penalty,
+            apply_whitening: false,
+            max_n_iterations: 1000,
+            tolerance: F::cast(1e-8)
         }
     }
 
@@ -168,6 +240,55 @@ impl Pca<f64> {
     /// Return the singular values
     pub fn singular_values(&self) -> &Array1<f64> {
         &self.sigma
+    }
+
+    pub fn vt(x: Array2<f64>, pca_params: &PcaParams<f64>) -> (Array1<f64>, Array2<f64>) {
+        // We are not doing Sparse PCA
+        // estimate Singular Value Decomposition
+        let result =
+            TruncatedSvd::new(x, TruncatedOrder::Largest).decompose(pca_params.n_components).unwrap();
+
+        // explained variance is the spectral distribution of the eigenvalues
+        let (_, sigma, mut v_t) = result.values_vectors();
+
+        return (sigma, v_t);
+    }
+
+    pub fn sparse_vt<F: Float + MagnitudeCorrection + Lapack>(x: &Array2<F>, pca_params: &PcaParams<F>) -> (Array1<F>, Array2<F>) {
+        // If any of the penalties are positive, we are doing sparse PCA
+        let mut b = Array2::eye(pca_params.n_components);
+
+        let penalty = pca_params.l1_penalty + pca_params.l2_penalty;
+        let ratio = pca_params.l1_penalty / penalty;
+        let elasticnet_params = ElasticNet::params()
+            .penalty(penalty)
+            .l1_ratio(ratio);
+
+        let mut sigma: Option<Array1<F>> = None;
+        let v_t = loop {
+            let result = svd(x.to_owned(), &b, pca_params.n_components, 1e-6, pca_params.max_n_iterations);
+            let (u, sig, mut v_t) = result.unwrap().values_vectors();
+            let a = u.dot(&v_t);
+            let y = x.dot(&a);
+            let b_old = b.clone();
+
+            if sigma.is_none() {
+                sigma = Some(sig);
+            }
+
+            Zip::from(b.genrows_mut()).and(y.genrows()).apply(|mut b_row, ev| {
+                let dataset = DatasetView::new(x.view(), ev);
+                let model = elasticnet_params.fit(&dataset).unwrap();
+                b_row.assign(model.parameters());
+            });
+
+            if (b_old-&b).mapv(|x| x*x).sum() < F::cast(1e-6) {
+                let norms = normalize(b, NormalizeAxis::Row).0;
+                break norms;
+            }
+        };
+
+        return (sigma.unwrap(), v_t);
     }
 }
 
